@@ -22,6 +22,10 @@ from dataclasses import dataclass
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# Fixed shapes dominate the read loop; benchmark picks faster conv/attention
+# algorithms once and reuses them. Off by default in PyTorch.
+if torch.backends.cudnn.is_available():
+    torch.backends.cudnn.benchmark = True
 
 
 # ----------------------------------------------------------------------------

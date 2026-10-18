@@ -380,7 +380,8 @@ class RecurCoder(nn.Module):
 
     def generate(self, idx, max_new_tokens, temperature=0.0, top_k=0,
                  top_p=1.0, collect=False, rep_penalty=1.0,
-                 no_repeat_ngram=0, adapt_strength=2.5, adapt_decay=0.88):
+                 no_repeat_ngram=0, adapt_strength=2.5, adapt_decay=0.88,
+                 adapt_window=128):
         # The prompt's forward admits the experts its characters ask for most,
         # and then every character of the reply is a forward of its own that
         # adds its requests to the vote and routes among what the prompt and
@@ -407,7 +408,8 @@ class RecurCoder(nn.Module):
             nxt = pick_next(logits[:, -1, :].float(), out, temperature, top_k,
                             top_p, rep_penalty, no_repeat_ngram,
                             adapt_strength=adapt_strength,
-                            adapt_decay=adapt_decay)
+                            adapt_decay=adapt_decay,
+                            adapt_window=adapt_window)
             out = torch.cat([out, nxt], dim=1)
             cur = nxt
         return (out, steps_log) if collect else out

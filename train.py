@@ -565,6 +565,170 @@ def _lanes(files, seed, roots=None, resume=0):
             for j, k in enumerate(sorted(by))]
 
 
+# Sample-prompt labels that are not top-level train folders.
+_WEIGHT_ALIASES = {"chat_hermes": "chat", "hermes": "chat"}
+
+
+def _parse_subject_weights(raw):
+    """
+    name -> relative visit weight. A dict from config.yaml, or `a=2,b=1`
+    from the flag. Empty means every subject weighs 1.
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        out = {str(k): float(v) for k, v in raw.items()}
+    else:
+        out = {}
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise SystemExit(
+                    f"bad --subject-weights entry {part!r}; want name=weight "
+                    f"(e.g. chat=3,stories=2)")
+            k, v = part.split("=", 1)
+            out[k.strip()] = float(v)
+    fixed = {}
+    for k, v in out.items():
+        fixed[_WEIGHT_ALIASES.get(k, k)] = fixed.get(
+            _WEIGHT_ALIASES.get(k, k), 0.0) + v
+    return fixed
+
+
+def _lane_probs(lanes, weights, warn=True):
+    """Per-lane visit probabilities from relative weights; missing -> 1."""
+    names = {l.name for l in lanes}
+    unused = sorted(k for k in weights if k not in names)
+    if warn and unused:
+        print(f"  (subject_weights unused - no such lane: "
+              f"{', '.join(unused)})", flush=True)
+    w = np.array([float(weights.get(l.name, 1.0)) for l in lanes],
+                 dtype=np.float64)
+    w = np.maximum(w, 0.0)
+    if not w.any():
+        w[:] = 1.0
+    return w / w.sum()
+
+
+def _suggest_resident(d_model, width, depth, floor, mem_frac=0.90,
+                      overhead_gb=4.5):
+    """
+    How many expert slots a card can hold above `floor`.
+
+    Cold estimate: total VRAM * mem_frac minus trunk/activation overhead,
+    divided by one expert's train state (fp32 weights+grad + bf16 moments).
+    Caps growth so a bad overhead guess cannot fill the card.
+    """
+    if not torch.cuda.is_available():
+        return floor
+    total = torch.cuda.get_device_properties(0).total_memory
+    per = max(1, int(depth) * 3 * int(d_model) * int(width) * 12)
+    budget = total * float(mem_frac) - overhead_gb * 1e9
+    n = int(budget // per)
+    # Cap: floor+32 or 96. Lets a 12 GB card climb from resident 48 toward ~80.
+    return max(int(floor), min(n, int(floor) + 32, 96))
+
+
+def _hood_row(pool, model, *, step=None, chars=None, lane=None, loss=None,
+              lr=None, gap=None, ctx=None, visits=None, swapped=0, did=0,
+              plast=None, grads=None, device=None, extra=None):
+    """Under-the-hood snapshot: paging, depth, mix, VRAM, plasticity."""
+    rp = pool.report() if pool is not None else {}
+    sat = pool.saturation() if pool is not None and hasattr(pool, "saturation") \
+        else {}
+    slots = []
+    if pool is not None and getattr(pool, "slots", None) is not None:
+        slots = [int(e) for e in pool.slots if int(e) >= 0]
+    gates = []
+    try:
+        if pool is not None and getattr(pool, "gate", None) is not None and slots:
+            g = pool.gate.detach().abs().float()
+            gates = sorted((float(g[i]) for i in slots), reverse=True)
+    except Exception:
+        gates = []
+    depth = getattr(model, "last_steps", None)
+    vram = None
+    if device is not None and getattr(device, "type", None) == "cuda":
+        vram = round(torch.cuda.max_memory_allocated() / 1e6, 1)
+    row = {
+        "t": time.time(), "step": step, "chars": chars, "lane": lane,
+        "loss": None if loss is None else round(float(loss), 4),
+        "lr": None if lr is None else float(lr),
+        "gap": None if gap is None else round(float(gap), 4),
+        "ctx": ctx,
+        "experts": int(pool.n_experts()) if pool is not None else None,
+        "on_card": slots,
+        "loads_per_chunk": round(swapped / max(did, 1), 2),
+        "hit_rate": round(float(rp.get("hit_rate", 0.0)), 3),
+        "ram_held": rp.get("ram_held"),
+        "disk_reads": rp.get("disk_reads"),
+        "writebacks": rp.get("writebacks"),
+        "depth": None if depth is None else round(float(depth), 2),
+        "dying": sat.get("idle"),
+        "entropy_frac": None if sat.get("entropy_frac") is None
+                        else round(float(sat["entropy_frac"]), 3),
+        "gate_top": [round(x, 4) for x in gates[:5]],
+        "visits": dict(visits) if visits else None,
+        "grad": None if not grads else round(float(np.mean(grads)), 3),
+        "vram_mb": vram,
+        "plast": None if plast is None else plast.state(),
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _hood_line(row):
+    """One terminal line from a hood snapshot."""
+    bits = []
+    if row.get("lane") is not None:
+        bits.append(str(row["lane"]))
+    if row.get("loss") is not None:
+        bits.append(f"loss {row['loss']:.4f}")
+    if row.get("depth") is not None:
+        bits.append(f"depth {row['depth']:.1f}")
+    if row.get("experts") is not None:
+        n_on = len(row.get("on_card") or [])
+        bits.append(f"pool {row['experts']} on_card {n_on}")
+    if row.get("loads_per_chunk") is not None:
+        bits.append(f"load/chunk {row['loads_per_chunk']:.1f}")
+    if row.get("hit_rate") is not None:
+        bits.append(f"RAM hit {row['hit_rate']:.2f}")
+    if row.get("dying") is not None:
+        bits.append(f"dying {row['dying']}")
+    if row.get("entropy_frac") is not None:
+        bits.append(f"H {row['entropy_frac']:.2f}")
+    if row.get("gate_top"):
+        bits.append("gates " + ",".join(f"{g:.3f}" for g in row["gate_top"][:3]))
+    if row.get("lr") is not None:
+        bits.append(f"lr {row['lr']:.2e}")
+    if row.get("gap") is not None:
+        bits.append(f"gap {row['gap']:+.3f}")
+    if row.get("ctx") is not None:
+        bits.append(f"ctx {row['ctx']:,}")
+    if row.get("vram_mb") is not None:
+        bits.append(f"vram {row['vram_mb']:.0f}MB")
+    if row.get("visits"):
+        top = sorted(row["visits"].items(), key=lambda kv: -kv[1])[:4]
+        tot = sum(row["visits"].values()) or 1
+        bits.append("mix " + " ".join(f"{n}={c/tot:.0%}" for n, c in top))
+    return "  hood  " + "  ".join(bits)
+
+
+def _write_status(path, row):
+    """Append one JSON line; never raise into the training loop."""
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(row, separators=(",", ":"), default=str) + "\n")
+    except OSError as e:
+        print(f"    (status not written: {e})", flush=True)
+
+
 def _truncate_history(path, chars):
     """Drop history rows past `chars` - they belong to a branch that was
     abandoned, and every reader of this file assumes it moves forward."""
@@ -671,6 +835,24 @@ def cmd_read(args):
           + (f", {args.passes} passes" if args.passes > 1 else ""))
 
     wdir = args.weights_dir
+    # Size resident slots from the card before the pool tensors exist.
+    # build_paged takes args.resident; create() still writes the config floor
+    # into the manifest as pool_resident - a note, not a cage.
+    if getattr(args, "auto_resident", False) and device.type == "cuda":
+        from minagi.config import load as _load_c, get as _gc
+        _cc = _load_c()
+        floor = int(args.resident or _gc(_cc, "pool.resident", 32) or 32)
+        got = _suggest_resident(
+            _gc(_cc, "model.d_model", 512),
+            _gc(_cc, "pool.width", _gc(_cc, "pool.d_ff", 2048)),
+            _gc(_cc, "pool.depth", 1),
+            floor,
+            mem_frac=float(getattr(args, "grow_mem_frac", 0.9) or 0.9))
+        if got != floor:
+            print(f"  auto_resident: {floor} -> {got} "
+                  f"(from {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB "
+                  f"card, floor {floor})", flush=True)
+        args.resident = got
     # No model here yet is a model that has not been made yet, not an error.
     # Everything about its shape is in config.yaml, so there is nothing to ask.
     #
@@ -697,7 +879,7 @@ def cmd_read(args):
         else:
             print(f"{wdir} does not exist - creating a fresh model from "
                   f"config.yaml")
-        create(wdir, force=True)
+        create(wdir, force=True, resident=args.resident)
         print()
     model, cfg, pool, man = build_paged(wdir, device, args.resident,
                                         args.ram_capacity, args.context)
@@ -1039,11 +1221,45 @@ def cmd_read(args):
     target = info["characters"] * max(1, args.passes)
     if args.max_chars:
         target = min(target, int(args.max_chars))
+    subj_w = _parse_subject_weights(getattr(args, "subject_weights", None))
+    boost_chars = int(getattr(args, "speech_boost_chars", 0) or 0)
+    boost_mult = float(getattr(args, "speech_boost", 1.0) or 1.0)
+    _bs = getattr(args, "speech_subjects", None) or [
+        "chat", "stories", "reasoning", "self-knowledge"]
+    if isinstance(_bs, str):
+        _bs = [x.strip() for x in _bs.split(",") if x.strip()]
+    boost_names = set(_bs)
+
+    _w_warned = [False]
+
+    def lane_probs_at(chars_seen):
+        w = dict(subj_w)
+        if boost_chars > 0 and boost_mult != 1.0 and chars_seen < boost_chars:
+            for name in boost_names:
+                w[name] = float(w.get(name, 1.0)) * boost_mult
+        p = _lane_probs(lanes, w, warn=not _w_warned[0])
+        _w_warned[0] = True
+        return p
+
+    lane_p = lane_probs_at(base_chars)
+    # Separate stream from the per-lane file RNGs so visit order is not tied
+    # to which offsets those lanes draw.
+    visit_rng = np.random.default_rng(
+        [args.shuffle_seed, 9173, int(man.get("read_chars", 0) or 0)])
+    accum_n = max(1, int(getattr(args, "accum", 1) or 1))
     print(f"  {len(lanes)} subjects, reading {turn * args.chunk:,} characters "
           f"from one before moving to the next"
           + (f" ({turn * args.chunk // ctx_now} windows of {ctx_now:,})"
              if turn * args.chunk > ctx_now else "")
-          + ": " + ", ".join(l.name for l in lanes))
+          + ": " + ", ".join(
+              f"{l.name}={lane_p[i]:.0%}" for i, l in enumerate(lanes)))
+    if boost_chars > 0 and boost_mult != 1.0:
+        print(f"  speech boost x{boost_mult:g} on "
+              f"{', '.join(sorted(boost_names))} for first "
+              f"{boost_chars/1e6:.0f}M characters")
+    if accum_n > 1:
+        print(f"  accumulating {accum_n} chunks per optimiser step "
+              f"(effective {accum_n * args.chunk:,} characters)")
     if ctx_now < ctx_max:
         print(f"  the window grows by {args.context_step} character(s) "
               f"whenever the model is still gaining more than "
@@ -1053,6 +1269,9 @@ def cmd_read(args):
 
     rates_path = os.path.join(os.path.dirname(args.sample_log) or ".",
                               "expert_rates.jsonl")
+    visit_counts = collections.Counter()
+    last_hood = time.time()
+    log_every_sec = float(getattr(args, "log_every_min", 0) or 0) * 60.0
 
     def log_rates(chars, main):
         # Each expert's learning rate at this check, as a factor of `lr`, for
@@ -1069,14 +1288,14 @@ def cmd_read(args):
         except Exception as e:                  # never stops a run
             print(f"    (rates not written: {e})", flush=True)
 
-    def log_history(val=None):
+    def log_history(val=None, hood=None):
         """
         Append what the pool looks like now, so a run leaves a trail.
 
         The manifest only ever holds the latest state, which cannot answer
         whether an expert earned its gate early and coasted or climbed all
         along. One line per checkpoint, and a run of any length stays
-        readable afterwards.
+        readable afterwards. `hood` adds the live paging/mix snapshot.
         """
         if not args.history:
             return
@@ -1088,14 +1307,42 @@ def cmd_read(args):
                    "gate": t["gate"], "use": t["use"], "admits": t["admits"],
                    "born": t["born"],
                    "last_seen": t.get("last_seen"), "uid": t.get("uid"),
-                   "trial": getattr(model.pool, "trial", 0)}
+                   "trial": getattr(model.pool, "trial", 0),
+                   "ctx": ctx_now, "lr": float(plast.factor()) * args.lr,
+                   "gap": last_gap,
+                   "visits": dict(visit_counts)}
+            if hood:
+                # keep history lean: drop heavy on_card list duplicates of gate
+                slim = {k: v for k, v in hood.items()
+                        if k not in ("gate", "use", "admits", "born",
+                                     "last_seen", "uid")}
+                row["hood"] = slim
             os.makedirs(os.path.dirname(args.history) or ".", exist_ok=True)
             with open(args.history, "a") as f:
-                f.write(json.dumps(row, separators=(",", ":")) + "\n")
+                f.write(json.dumps(row, separators=(",", ":"),
+                                   default=str) + "\n")
         except Exception as e:                  # telemetry must never stop a run
             print(f"    (history not written: {e})", flush=True)
 
-    def checkpoint(val=None):
+    def emit_hood(kind, lane=None, loss=None):
+        """Print + status.jsonl + optional history hood field."""
+        lr_now = None
+        try:
+            lr_now = float(opt.param_groups[-1]["lr"])
+        except (IndexError, KeyError, TypeError):
+            lr_now = float(plast.factor()) * args.lr
+        row = _hood_row(
+            pool, model, step=step, chars=base_chars + seen, lane=lane,
+            loss=loss if loss is not None
+                 else (float(np.mean(recent)) if recent else None),
+            lr=lr_now, gap=last_gap, ctx=ctx_now, visits=visit_counts,
+            swapped=swapped, did=did, plast=plast, grads=grads,
+            device=device, extra={"kind": kind})
+        print(_hood_line(row), flush=True)
+        _write_status(getattr(args, "status_log", None), row)
+        return row
+
+    def checkpoint(val=None, hood=None):
         # There is no reading position to record any more: windows are drawn
         # at random, so what carries forward is how much has been read, not
         # where the reader had got to.
@@ -1105,7 +1352,10 @@ def cmd_read(args):
                                   "read_nats": nats,
                                   "plasticity": plast.state(),
                                   "context_now": ctx_now})
-        log_history(val)
+        if hood is None:
+            hood = emit_hood("checkpoint",
+                             loss=float(np.mean(recent)) if recent else None)
+        log_history(val, hood=hood)
 
     stop = False
     swapped = 0
@@ -1191,282 +1441,305 @@ def cmd_read(args):
         signal.signal(signal.SIGTERM, _on_int)
     except ValueError:
         pass                                   # not the main thread
-    # Read a window from one subject, then a window from the next. Reading a
-    # file end to end instead meant 200,000 characters - seventeen minutes at
-    # this speed - of one subject with nothing to balance it, and the held-out
-    # score swung by two nats depending on which subject the reader happened
-    # to be inside.
+    # Draw a subject by weight, read one visit, draw again. Equal round-robin
+    # starved chat under wikipedia/chess; weights keep every lane alive and
+    # put more characters into speech. Reading one file end to end instead
+    # meant 200,000 characters of one subject and held-out swung by two nats.
+    pending = 0
+    opt.zero_grad(set_to_none=True)
+
+    def _opt_flush():
+        """Clip and step once the accumulated chunks are in .grad."""
+        nonlocal pending
+        if pending <= 0:
+            return
+        grads.append(float(torch.nn.utils.clip_grad_norm_(
+            model.parameters(), args.clip)))
+        if step % 8 == 0:
+            # how much of the trunk gradient is signal. Reported only:
+            # a signal is watched before it is trusted with anything.
+            snr.observe(trunk)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        pending = 0
+
     while not stop and seen < target:
-        for lane in lanes:
-            r = lane.open(model, args.chunk, ctx_now, device,
-                          turn * args.chunk)
-            if r is None:
-                continue
-            path, data = r.name, r.data
-            fl = []
-            for j in range(turn):
-                if r.done():
-                    break
-                # The experts come from the forward itself: the window's
-                # first pass admits the ones its characters ask for most, and
-                # they stay on the card through the backward and the
-                # optimiser step. `loads_before` only counts them.
-                nxt = r.peek()
-                loads_before = pool.loads
-                # One rate, scaled by the plasticity controller. It moves
-                # only when held-out says something has changed - down on a
-                # plateau, back up when the ground moves - so there is no
-                # horizon to be wrong about and no count of characters
-                # anywhere in it.
-                scale = plast.factor()
-                pool.main_scale = scale
-                for gg in opt.param_groups:
-                    gg["lr"] = gg.get("base_lr", gg["lr"]) * scale
-                opt.zero_grad(set_to_none=True)
-                # the reader wraps its own forward in the process-wide
-                # precision; backward runs outside it on purpose, replaying
-                # the dtypes the forward recorded into the parameters' fp32
-                if tracer is not None and not tracer.full():
-                    from minagi.pool import capture_routes
-                    with capture_routes() as got:
-                        loss = r.step(learn=True, aux_weight=cfg.pool_aux)
-                    moved = pool.loads - loads_before
-                    if loss is not None and got:
-                        tracer.add(got, pool, lane, moved, step, float(loss),
-                                   seen, nxt)
-                else:
-                    loss = r.step(learn=True, aux_weight=cfg.pool_aux)
-                # writing is a side errand - it must never stand in for the
-                # forward, or backward would run on the previous chunk's
-                # freed graph
-                if tracer is not None and tracer.done() and not tracer.written:
-                    tracer.write(cfg, args.precision, args.chunk)
-                if loss is None:
-                    break
-                loss.backward()
-                grads.append(float(torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.clip)))
-                if step % 8 == 0:
-                    # how much of the trunk gradient is signal. Reported only:
-                    # a signal is watched before it is trusted with anything.
-                    snr.observe(trunk)
-                opt.step()
-                moved = pool.loads - loads_before      # admitted by the forward
-                swapped += moved
-                if tracer is not None and not tracer.done():
-                    # j == 0 is the chunk that opens this lane's window -
-                    # the only point where the subject actually changes
-                    tracer.add_swap(lane, moved, j == 0)
-                # nothing to detach: the reader re-forwards its whole window
-                # every step so the gradient can reach all of it, and keeps no
-                # cache between steps. Detaching is what used to cut the
-                # gradient at the chunk boundary.
-                fl.append(float(loss))
-                recent.append(float(loss))
-                by_pos[j].append(float(loss))
-                seen += args.chunk
-                nats += float(loss) * args.chunk
-                step += 1
-                pool.now = step          # the clock the expert trial reads
-                plast.tick()
-                did += 1
-                if args.sample_every and (
-                        time.time() - last_sample >= args.sample_every * 60):
-                    # READING SPEED closes here, before the held-out check and
-                    # the samples: characters trained over the time spent
-                    # reading since the last round ended. Neither the check
-                    # nor the writing can leak into it.
-                    read_rate = (seen - mark_c) / max(time.time() - mark_t,
-                                                      1e-6)
-                    v_ = se_ = None
-                    dom = None
-                    if ev is not None:
-                        d = ev.run(sample_eval_steps, spread=True)
-                        se_ = d.pop("stderr", None)
-                        # at the level the start measured - see `level`
-                        d = {k: x + level.get(k, 0.0) for k, x in d.items()}
-                        v_ = float(np.mean(list(d.values())))
-                        # The generalisation gap, kept for the growth
-                        # decision. It is the thing the density ceiling was
-                        # always a proxy for, and unlike density it is
-                        # measured rather than assumed.
-                        if recent:
-                            last_gap = v_ - float(np.mean(recent))
-                        dom = dict(d)
-                        moved_lr = plast.observe(v_, se_)
-                        pool.relax_rates()
-                        if args.newborn_lr:
-                            log_rates(base_chars + seen, plast.factor())
-                        if moved_lr:
-                            print(f"    {moved_lr}", flush=True)
-                    # WRITING SPEED: the characters the samples wrote over the
-                    # time spent writing them. Every reading writes exactly
-                    # sample_chars.
-                    variants = _sample_variants(args)
-                    t_w = time.time()
-                    s = sample_now(model, tok, device, args.sample_chars,
-                                   variants=variants)
-                    write_rate = (len(SAMPLE_PROMPTS) * len(variants)
-                                  * args.sample_chars
-                                  / max(time.time() - t_w, 1e-6))
-                    tr = float(np.mean(recent)) if recent else None
-                    write_samples(args.sample_log, step, base_chars + seen,
-                                  (time.time() - t0) / 60, s, v_, se_, dom,
-                                  pool.n_experts(), tr,
-                                  opt.param_groups[-1]["lr"],
-                                  info["characters"], ctx_now, ctx_max,
-                                  context_gain(), read_rate,
-                                  float(np.mean(grads)) if grads else None,
-                                  args.clip, plast.state(),
-                                  write_rate=write_rate,
-                                  level=(float(np.mean(list(level.values())))
-                                         if level and v_ is not None
-                                         else None))
-                    rp = pool.report()
-                    print(f"    samples -> {args.sample_log}"
-                          + (f"  train {float(np.mean(recent)):.4f}"
-                             if recent else "")
-                          + (f"  held-out {v_:.4f}" if v_ is not None else "")
-                          + (f"  signal {snr.ratio():.3f}"
-                             if snr.ratio() is not None else "")
-                          + f"  | {swapped/max(did,1):.1f} experts loaded "
-                            f"onto the card per chunk, RAM hit rate "
-                            f"{rp['hit_rate']:.2f}"
-                          + f"  | context {ctx_now:,}  reading "
-                            f"{read_rate:,.0f} char/s, writing "
-                            f"{write_rate:,.1f} char/s"
-                          + _dropped_note(model)
-                          + f"  ({(time.time()-t0)/60:.0f} min)", flush=True)
-                    if args.save:
-                        checkpoint(v_)
-                        last_save = time.time()
-                        print(f"    weights/ checkpointed", flush=True)
-                    elif args.history:
-                        # A dry read still trains in memory, and the gate
-                        # trajectory is the whole point of an experiment that
-                        # is not meant to keep its weights. Writing the
-                        # history costs nothing; writing the model costs
-                        # minutes and would dominate a short run.
-                        log_history(v_)
-                    # THE SAMPLE CLOCK starts when the round ends, so the next
-                    # round is due after `sample_every` minutes of reading
-                    # however long this one took. Started at the round's
-                    # beginning, a round longer than the interval made the
-                    # next one due at once, and the run read one step between
-                    # rounds.
-                    last_sample = mark_t = time.time()
-                    mark_c = seen
-                # Gathering the evidence and acting on it are separate
-                # things. Tied together, the window grew one character per
-                # evidence batch - measured, 29 characters in 6 million read,
-                # so reaching 16k would have needed more text than the corpus
-                # holds. The evidence is re-gathered every context_every
-                # chunks; while it says the model is still gaining deep into
-                # the window, the window grows a character per chunk.
-                if ctx_now < ctx_max and ctx_every_steps:
-                    if step % ctx_every_steps == 0:
-                        g_ = context_gain()
-                        if g_ is not None:
-                            wants_more = g_ > args.context_gain_min
-                            by_pos.clear()
-                    # One character at a time, and not on every chunk. The
-                    # window is small early, so a character per chunk is a
-                    # quarter of the window per sample interval - fast in the
-                    # terms that matter, since what decides whether the model
-                    # keeps up is how much the window grows relative to what
-                    # it already handles.
-                    if wants_more and step % ctx_grow_every_steps == 0:
-                        ctx_now = min(ctx_max, ctx_now + args.context_step)
-                        turn = visit_chunks(ctx_now)
-                if (args.save and args.save_every
-                        and time.time() - last_save >= args.save_every * 60):
-                    last_save = time.time()
-                    checkpoint()
-                    print(f"    weights/ checkpointed at step {step:,} "
-                          f"({seen/1e6:.1f}M characters)", flush=True)
-                if (grower is not None and grow_every_steps
-                        and step % grow_every_steps == 0):
-                    # Only a run that keeps what it learns may change what is
-                    # on disk. Growing writes new expert files and pruning
-                    # deletes and renumbers them, both immediately, while the
-                    # manifest that indexes them is only written at a
-                    # checkpoint - so a dry read that pruned and then stopped
-                    # left a directory naming experts that were no longer
-                    # there, and the next load died on the first missing file.
-                    gone = pool.prune(step, survival=survival_steps) \
-                        if args.save else 0
-                    # Whether the model may grow is asked of the model as
-                    # it is now, not of anything accumulated over the run.
-                    #
-                    # The one remaining question the pool cannot answer about
-                    # itself is whether it has started memorising, because
-                    # that needs a held-out set. Everything else - is capacity
-                    # idle, are recent additions earning, is there room - is a
-                    # property of the network at this instant and is asked
-                    # inside AutoGrow.
-                    #
-                    # What was here before was a ceiling on parameters per
-                    # character read, integrated over the whole run. It was
-                    # wrong twice over. Its unit ignored that a character of
-                    # chess costs 0.744 nats to predict and one of wikipedia
-                    # 1.686, so a long run of chess bought as much capacity as
-                    # a run of encyclopaedia. And measured against 117
-                    # checkpoints of this run it did not even track the thing
-                    # it stood in for: correlation with the gap +0.20, not
-                    # monotonic. It held growth off for 14M characters on
-                    # evidence that did not exist.
-                    gap_ok = (last_gap is None or args.max_gap <= 0
-                              or last_gap < args.max_gap)
-                    may_grow = gap_ok
-                    if not may_grow and step % (args.grow_every * 10) == 0:
-                        print(f"    growth held: train and held-out have "
-                              f"separated by {last_gap:.3f}, over "
-                              f"{args.max_gap:.2f} - that is memorising, and "
-                              f"more capacity would make it worse", flush=True)
-                    rec = (grower.step(float(loss), pool, step)
-                           if (args.save and may_grow) else {"grew": 0})
-                    if gone or rec["grew"]:
-                        _resync_opt(opt, model, args)
-                        pool.attach_optimiser(opt)
-                        # The expert files have already moved. Write the index
-                        # that names them NOW rather than waiting for the next
-                        # checkpoint: between those two moments the directory
-                        # describes a pool that no longer exists, and anything
-                        # that stops in the gap cannot be loaded again.
-                        if args.save:
-                            checkpoint()
-                            last_save = time.time()
-                        print(f"    pool {pool.n_experts()} experts "
-                              f"({'+%d' % rec['grew'] if rec['grew'] else ''}"
-                              f"{'-%d' % gone if gone else ''})  "
-                              f"{pool.vram_params()/1e6:.1f}M in VRAM  "
-                              f"vram {torch.cuda.max_memory_allocated()/1e6:.0f}MB"
-                              if device.type == "cuda" else "", flush=True)
-                if asked_stop or (args.minutes
-                                  and (time.time() - t0) / 60 >= args.minutes):
-                    break
-            if args.minutes and (time.time() - t0) / 60 >= args.minutes:
-                print(f"  reached {args.minutes:g} minutes", flush=True)
-                if args.save:
-                    checkpoint()
-                    print(f"    weights/ checkpointed at step {step:,} "
-                          f"({seen/1e6:.1f}M characters)", flush=True)
-                stop = True
-            elif asked_stop:
-                if args.save:
-                    checkpoint()
-                    print(f"    weights/ checkpointed at step {step:,} "
-                          f"({seen/1e6:.1f}M characters)", flush=True)
-                stop = True
-            lane.rest(model)               # the window is done; free its cache
-            if fl:
-                losses.append(float(np.mean(fl)))
-                if args.verbose:
-                    print(f"  {lane.name:<12} {os.path.relpath(path):<44} "
-                          f"{len(data)/1e3:>7.1f}k chars  loss {losses[-1]:.4f}",
-                          flush=True)
-            if stop or seen >= target:
+        lane_p = lane_probs_at(base_chars + seen)
+        lane = lanes[int(visit_rng.choice(len(lanes), p=lane_p))]
+        r = lane.open(model, args.chunk, ctx_now, device,
+                      turn * args.chunk)
+        if r is None:
+            continue
+        visit_counts[lane.name] += 1
+        path, data = r.name, r.data
+        fl = []
+        for j in range(turn):
+            if r.done():
                 break
+            # The experts come from the forward itself: the window's
+            # first pass admits the ones its characters ask for most, and
+            # they stay on the card through the backward and the
+            # optimiser step. `loads_before` only counts them.
+            nxt = r.peek()
+            loads_before = pool.loads
+            # One rate, scaled by the plasticity controller. It moves
+            # only when held-out says something has changed - down on a
+            # plateau, back up when the ground moves - so there is no
+            # horizon to be wrong about and no count of characters
+            # anywhere in it.
+            scale = plast.factor()
+            pool.main_scale = scale
+            for gg in opt.param_groups:
+                gg["lr"] = gg.get("base_lr", gg["lr"]) * scale
+            # the reader wraps its own forward in the process-wide
+            # precision; backward runs outside it on purpose, replaying
+            # the dtypes the forward recorded into the parameters' fp32
+            if tracer is not None and not tracer.full():
+                from minagi.pool import capture_routes
+                with capture_routes() as got:
+                    loss = r.step(learn=True, aux_weight=cfg.pool_aux)
+                moved = pool.loads - loads_before
+                if loss is not None and got:
+                    tracer.add(got, pool, lane, moved, step, float(loss),
+                               seen, nxt)
+            else:
+                loss = r.step(learn=True, aux_weight=cfg.pool_aux)
+            # writing is a side errand - it must never stand in for the
+            # forward, or backward would run on the previous chunk's
+            # freed graph
+            if tracer is not None and tracer.done() and not tracer.written:
+                tracer.write(cfg, args.precision, args.chunk)
+            if loss is None:
+                break
+            (loss / accum_n).backward()
+            pending += 1
+            if pending >= accum_n:
+                _opt_flush()
+            moved = pool.loads - loads_before      # admitted by the forward
+            swapped += moved
+            if tracer is not None and not tracer.done():
+                # j == 0 is the chunk that opens this lane's window -
+                # the only point where the subject actually changes
+                tracer.add_swap(lane, moved, j == 0)
+            # nothing to detach: the reader re-forwards its whole window
+            # every step so the gradient can reach all of it, and keeps no
+            # cache between steps. Detaching is what used to cut the
+            # gradient at the chunk boundary.
+            fl.append(float(loss))
+            recent.append(float(loss))
+            by_pos[j].append(float(loss))
+            seen += args.chunk
+            nats += float(loss) * args.chunk
+            step += 1
+            pool.now = step          # the clock the expert trial reads
+            plast.tick()
+            did += 1
+            if (log_every_sec > 0
+                    and time.time() - last_hood >= log_every_sec):
+                emit_hood("tick", lane=lane.name,
+                          loss=float(loss) if loss is not None else None)
+                last_hood = time.time()
+            if args.sample_every and (
+                    time.time() - last_sample >= args.sample_every * 60):
+                # READING SPEED closes here, before the held-out check and
+                # the samples: characters trained over the time spent
+                # reading since the last round ended. Neither the check
+                # nor the writing can leak into it.
+                read_rate = (seen - mark_c) / max(time.time() - mark_t,
+                                                  1e-6)
+                v_ = se_ = None
+                dom = None
+                if ev is not None:
+                    d = ev.run(sample_eval_steps, spread=True)
+                    se_ = d.pop("stderr", None)
+                    # at the level the start measured - see `level`
+                    d = {k: x + level.get(k, 0.0) for k, x in d.items()}
+                    v_ = float(np.mean(list(d.values())))
+                    # The generalisation gap, kept for the growth
+                    # decision. It is the thing the density ceiling was
+                    # always a proxy for, and unlike density it is
+                    # measured rather than assumed.
+                    if recent:
+                        last_gap = v_ - float(np.mean(recent))
+                    dom = dict(d)
+                    moved_lr = plast.observe(v_, se_)
+                    pool.relax_rates()
+                    if args.newborn_lr:
+                        log_rates(base_chars + seen, plast.factor())
+                    if moved_lr:
+                        print(f"    {moved_lr}", flush=True)
+                # WRITING SPEED: the characters the samples wrote over the
+                # time spent writing them. Every reading writes exactly
+                # sample_chars.
+                variants = _sample_variants(args)
+                t_w = time.time()
+                s = sample_now(model, tok, device, args.sample_chars,
+                               variants=variants)
+                write_rate = (len(SAMPLE_PROMPTS) * len(variants)
+                              * args.sample_chars
+                              / max(time.time() - t_w, 1e-6))
+                tr = float(np.mean(recent)) if recent else None
+                write_samples(args.sample_log, step, base_chars + seen,
+                              (time.time() - t0) / 60, s, v_, se_, dom,
+                              pool.n_experts(), tr,
+                              opt.param_groups[-1]["lr"],
+                              info["characters"], ctx_now, ctx_max,
+                              context_gain(), read_rate,
+                              float(np.mean(grads)) if grads else None,
+                              args.clip, plast.state(),
+                              write_rate=write_rate,
+                              level=(float(np.mean(list(level.values())))
+                                     if level and v_ is not None
+                                     else None))
+                print(f"    samples -> {args.sample_log}"
+                      + (f"  train {float(np.mean(recent)):.4f}"
+                         if recent else "")
+                      + (f"  held-out {v_:.4f}" if v_ is not None else "")
+                      + (f"  signal {snr.ratio():.3f}"
+                         if snr.ratio() is not None else "")
+                      + f"  | reading {read_rate:,.0f} char/s, writing "
+                        f"{write_rate:,.1f} char/s"
+                      + _dropped_note(model)
+                      + f"  ({(time.time()-t0)/60:.0f} min)", flush=True)
+                hood = emit_hood("sample", lane=lane.name,
+                                 loss=float(np.mean(recent)) if recent else None)
+                last_hood = time.time()
+                if args.save:
+                    checkpoint(v_, hood=hood)
+                    last_save = time.time()
+                    print(f"    weights/ checkpointed", flush=True)
+                elif args.history:
+                    # A dry read still trains in memory, and the gate
+                    # trajectory is the whole point of an experiment that
+                    # is not meant to keep its weights. Writing the
+                    # history costs nothing; writing the model costs
+                    # minutes and would dominate a short run.
+                    log_history(v_, hood=hood)
+                # THE SAMPLE CLOCK starts when the round ends, so the next
+                # round is due after `sample_every` minutes of reading
+                # however long this one took. Started at the round's
+                # beginning, a round longer than the interval made the
+                # next one due at once, and the run read one step between
+                # rounds.
+                last_sample = mark_t = time.time()
+                mark_c = seen
+            # Gathering the evidence and acting on it are separate
+            # things. Tied together, the window grew one character per
+            # evidence batch - measured, 29 characters in 6 million read,
+            # so reaching 16k would have needed more text than the corpus
+            # holds. The evidence is re-gathered every context_every
+            # chunks; while it says the model is still gaining deep into
+            # the window, the window grows a character per chunk.
+            if ctx_now < ctx_max and ctx_every_steps:
+                if step % ctx_every_steps == 0:
+                    g_ = context_gain()
+                    if g_ is not None:
+                        wants_more = g_ > args.context_gain_min
+                        by_pos.clear()
+                # One character at a time, and not on every chunk. The
+                # window is small early, so a character per chunk is a
+                # quarter of the window per sample interval - fast in the
+                # terms that matter, since what decides whether the model
+                # keeps up is how much the window grows relative to what
+                # it already handles.
+                if wants_more and step % ctx_grow_every_steps == 0:
+                    ctx_now = min(ctx_max, ctx_now + args.context_step)
+                    turn = visit_chunks(ctx_now)
+            if (args.save and args.save_every
+                    and time.time() - last_save >= args.save_every * 60):
+                last_save = time.time()
+                checkpoint()
+                print(f"    weights/ checkpointed at step {step:,} "
+                      f"({seen/1e6:.1f}M characters)", flush=True)
+            if (grower is not None and grow_every_steps
+                    and step % grow_every_steps == 0):
+                # Only a run that keeps what it learns may change what is
+                # on disk. Growing writes new expert files and pruning
+                # deletes and renumbers them, both immediately, while the
+                # manifest that indexes them is only written at a
+                # checkpoint - so a dry read that pruned and then stopped
+                # left a directory naming experts that were no longer
+                # there, and the next load died on the first missing file.
+                gone = pool.prune(step, survival=survival_steps) \
+                    if args.save else 0
+                # Whether the model may grow is asked of the model as
+                # it is now, not of anything accumulated over the run.
+                #
+                # The one remaining question the pool cannot answer about
+                # itself is whether it has started memorising, because
+                # that needs a held-out set. Everything else - is capacity
+                # idle, are recent additions earning, is there room - is a
+                # property of the network at this instant and is asked
+                # inside AutoGrow.
+                #
+                # What was here before was a ceiling on parameters per
+                # character read, integrated over the whole run. It was
+                # wrong twice over. Its unit ignored that a character of
+                # chess costs 0.744 nats to predict and one of wikipedia
+                # 1.686, so a long run of chess bought as much capacity as
+                # a run of encyclopaedia. And measured against 117
+                # checkpoints of this run it did not even track the thing
+                # it stood in for: correlation with the gap +0.20, not
+                # monotonic. It held growth off for 14M characters on
+                # evidence that did not exist.
+                gap_ok = (last_gap is None or args.max_gap <= 0
+                          or last_gap < args.max_gap)
+                may_grow = gap_ok
+                if not may_grow and step % (args.grow_every * 10) == 0:
+                    print(f"    growth held: train and held-out have "
+                          f"separated by {last_gap:.3f}, over "
+                          f"{args.max_gap:.2f} - that is memorising, and "
+                          f"more capacity would make it worse", flush=True)
+                rec = (grower.step(float(loss), pool, step)
+                       if (args.save and may_grow) else {"grew": 0})
+                if gone or rec["grew"]:
+                    _resync_opt(opt, model, args)
+                    pool.attach_optimiser(opt)
+                    # The expert files have already moved. Write the index
+                    # that names them NOW rather than waiting for the next
+                    # checkpoint: between those two moments the directory
+                    # describes a pool that no longer exists, and anything
+                    # that stops in the gap cannot be loaded again.
+                    if args.save:
+                        checkpoint()
+                        last_save = time.time()
+                    print(f"    pool {pool.n_experts()} experts "
+                          f"({'+%d' % rec['grew'] if rec['grew'] else ''}"
+                          f"{'-%d' % gone if gone else ''})  "
+                          f"{pool.vram_params()/1e6:.1f}M in VRAM  "
+                          f"vram {torch.cuda.max_memory_allocated()/1e6:.0f}MB"
+                          if device.type == "cuda" else "", flush=True)
+            if asked_stop or (args.minutes
+                              and (time.time() - t0) / 60 >= args.minutes):
+                break
+        _opt_flush()                   # do not leave a partial accum hanging
+        if args.minutes and (time.time() - t0) / 60 >= args.minutes:
+            print(f"  reached {args.minutes:g} minutes", flush=True)
+            if args.save:
+                checkpoint()
+                print(f"    weights/ checkpointed at step {step:,} "
+                      f"({seen/1e6:.1f}M characters)", flush=True)
+            stop = True
+        elif asked_stop:
+            if args.save:
+                checkpoint()
+                print(f"    weights/ checkpointed at step {step:,} "
+                      f"({seen/1e6:.1f}M characters)", flush=True)
+            stop = True
+        lane.rest(model)               # the window is done; free its cache
+        if fl:
+            losses.append(float(np.mean(fl)))
+            if args.verbose:
+                depth = getattr(model, "last_steps", None)
+                dbit = (f"  depth {float(depth):.1f}" if depth is not None
+                        else "")
+                print(f"  {lane.name:<12} {os.path.relpath(path):<44} "
+                      f"{len(data)/1e3:>7.1f}k chars  loss {losses[-1]:.4f}"
+                      f"{dbit}  visits {visit_counts[lane.name]}",
+                      flush=True)
+        if stop or seen >= target:
+            break
+    _opt_flush()
     el = time.time() - t0
     read_rate = (seen - mark_c) / max(time.time() - mark_t, 1e-6)
     print(f"\nread {seen/1e6:.2f}M characters in {el/60:.1f}m "
@@ -1570,7 +1843,9 @@ def _sample_variants(args):
     if not getattr(args, "sample_raw_only", False):
         v.append(("adapted", dict(rep_penalty=args.rep_penalty,
                                   adapt_strength=args.adapt_strength,
-                                  adapt_decay=args.adapt_decay)))
+                                  adapt_decay=args.adapt_decay,
+                                  adapt_window=getattr(args, "adapt_window",
+                                                       128))))
     return v
 
 
@@ -1680,8 +1955,8 @@ def sample_now(model, tok, device, n_new=140, variants=None):
     from minagi.decode import pick_next
     if variants is None:
         variants = [("raw", dict(rep_penalty=1.0, adapt_strength=0.0)),
-                    ("adapted", dict(rep_penalty=1.0, adapt_strength=2.5,
-                                     adapt_decay=0.88))]
+                    ("adapted", dict(rep_penalty=1.0, adapt_strength=3.0,
+                                     adapt_decay=0.88, adapt_window=128))]
     was_training = model.training
     model.eval()
     out = []
@@ -2163,6 +2438,12 @@ def main():
                     default=_cfg(_c, "data.shuffle_seed", 0),
                     help="seed for which file and which offset each window is "
                          "drawn from")
+    rd.add_argument("--log-every-min", type=float,
+                    default=_cfg(_c, "logging.every_min", 2.0),
+                    help="minutes between under-the-hood heartbeats; 0 off")
+    rd.add_argument("--status-log",
+                    default=_cfg(_c, "logging.status", "runs/status.jsonl"),
+                    help="JSONL of hood snapshots for tail -f; empty disables")
     rd.add_argument("--sample-every", type=float, default=0,
                     help="minutes between writing sample generations")
     rd.add_argument("--sample-log", default="runs/samples.txt")
@@ -2194,6 +2475,34 @@ def main():
     rd.add_argument("--resident", type=int,
                     default=_cfg(_c, "pool.resident", None),
                     help="experts held in VRAM; the rest stay on disk")
+    rd.add_argument("--accum", type=int,
+                    default=_cfg(_c, "training.accum", 1),
+                    help="chunks whose gradients average before an optimiser "
+                         "step; graph still spans one chunk")
+    rd.add_argument("--subject-weights",
+                    default=_cfg(_c, "data.subject_weights", None),
+                    help="relative visit weights, as a mapping in config.yaml "
+                         "or name=w,name=w on the flag; missing names weigh 1")
+    rd.add_argument("--speech-boost-chars", type=int,
+                    default=_cfg(_c, "data.speech_boost_chars", 0),
+                    help="characters of speech-boosted mixing at the start; "
+                         "0 disables")
+    rd.add_argument("--speech-boost", type=float,
+                    default=_cfg(_c, "data.speech_boost", 1.0),
+                    help="multiply speech_subjects weights during the boost "
+                         "window")
+    rd.add_argument("--speech-subjects",
+                    default=_cfg(_c, "data.speech_subjects",
+                                 ["chat", "stories", "reasoning",
+                                  "self-knowledge"]),
+                    help="subjects the speech boost multiplies; comma list "
+                         "or config list")
+    rd.add_argument("--auto-resident", dest="auto_resident",
+                    action="store_true",
+                    default=bool(_cfg(_c, "pool.auto_resident", False)),
+                    help="raise --resident toward free VRAM at launch")
+    rd.add_argument("--no-auto-resident", dest="auto_resident",
+                    action="store_false")
     rd.add_argument("--passage", type=int,
                     default=_cfg(_c, "data.passage", 65536),
                     help="contiguous characters read from one file before "
@@ -2295,6 +2604,9 @@ def main():
                          "0 disables the adaptation trace")
     rd.add_argument("--adapt-decay", type=float,
                     default=_cfg(_c, "decoding.adapt_decay", 0.88))
+    rd.add_argument("--adapt-window", type=int,
+                    default=_cfg(_c, "decoding.adapt_window", 128),
+                    help="characters the adaptation trace looks back over")
     rd.add_argument("--rep-penalty", type=float,
                     default=_cfg(_c, "decoding.rep_penalty", 1.0),
                     help="the older, weaker loop guard; off by default")

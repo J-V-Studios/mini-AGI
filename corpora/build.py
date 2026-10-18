@@ -32,8 +32,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LANES = ["wikipedia", "stories", "chat", "reasoning",
          "arithmetic", "code", "chess", "self-knowledge"]
 
-SAMPLED = {"wikipedia": 120_000, "stories": 400_000,
-           "chat": 200_000, "reasoning": 20_000}
+# Default (non --full) sizes. Speech lanes dominate: scale is data × pool.
+SAMPLED = {"wikipedia": 60_000, "stories": 800_000,
+           "chat": 600_000, "reasoning": 80_000}
 
 
 def _has_files(d):

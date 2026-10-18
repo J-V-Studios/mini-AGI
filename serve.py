@@ -165,13 +165,12 @@ def load(weights, device=None, learn=True, lr=3e-4, save_every=8,
             trunk_lr_mult=_g(c, "training.trunk_lr_mult", 0.1),
             wd=_g(c, "training.weight_decay", 0.1),
             clip=_g(c, "training.clip", 1.0),
-            # Defaults to the granularity the corpus is read at, so talking
-            # to it and reading a book are one mechanism. That is the right
-            # default and a poor fit for a short session: at 2048 an exchange
-            # of ninety characters needs twenty-odd turns to reach one step.
-            # --learn-chunk trades that against the denser diet live.py warns
-            # about.
-            chunk=chunk or _g(c, "training.chunk", 2048),
+            # serving.learn_chunk (default 512) so a short chat reaches a
+            # step in a few turns; training.chunk is the corpus fallback.
+            # --learn-chunk still wins. Denser's cost: see minagi/live.py.
+            chunk=(chunk
+                   or _g(c, "serving.learn_chunk", None)
+                   or _g(c, "training.chunk", 2048)),
             save_every=save_every,
             weights_dir=weights,
             manifest=_manifest(weights))
@@ -255,6 +254,7 @@ def stream(prompt, max_new):
     c = _lc()
     strength = _g(c, "decoding.adapt_strength", 2.5)
     decay = _g(c, "decoding.adapt_decay", 0.88)
+    adapt_window = int(_g(c, "decoding.adapt_window", 128))
 
     model, tok = STATE["model"], STATE["tok"]
     device = next(model.parameters()).device
@@ -323,7 +323,8 @@ def stream(prompt, max_new):
                 yield {"swap": {"at": i, "moved": int(moved),
                                 "pool": resident_experts()}}
         nxt = pick_next(logits[:, -1, :].float(), out, temperature=0.0,
-                        adapt_strength=strength, adapt_decay=decay)
+                        adapt_strength=strength, adapt_decay=decay,
+                        adapt_window=adapt_window)
         out = torch.cat([out, nxt], dim=1)
         cur = nxt
         logits = None                       # spent; the next pass recomputes

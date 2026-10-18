@@ -59,6 +59,14 @@ def create(out, seed=0, verbose=True, force=False, **over):
     max_steps  = int(pick("max_steps", "model.max_steps", default=6))
     top_k      = int(pick("top_k", "pool.top_k", default=8))
 
+    if d_model % n_head != 0:
+        raise SystemExit(
+            f"model.d_model ({d_model}) must divide evenly by model.n_head "
+            f"({n_head}); head_dim would be {d_model / n_head}")
+    if top_k > resident:
+        raise SystemExit(
+            f"pool.top_k ({top_k}) cannot exceed pool.resident ({resident})")
+
     if os.path.exists(out):
         if not force:
             raise FileExistsError(f"{out} exists; pass force=True to replace it")

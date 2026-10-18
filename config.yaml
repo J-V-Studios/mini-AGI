@@ -7,9 +7,11 @@ model:
   # THIS BLOCK BUILDS A MODEL; IT DOES NOT CHANGE ONE. Down as far as the
   # depth rule, these are fixed in the manifest when the weights are created.
   # Editing them later does nothing - the shapes would no longer match.
-  d_model: 512            # width of the trunk
-  n_head: 8               # attention heads
-  d_ff: 1408              # the trunk's own feed-forward
+  # Scale: widen once at create; lifelong scale is the disk pool + resident.
+  # Fresh weights only. Creator toy was d_model 512.
+  d_model: 768            # width of the trunk (was 512)
+  n_head: 12              # attention heads; head_dim stays 64
+  d_ff: 2048              # the trunk's own feed-forward (was 1408)
   n_prelude: 2            # dense blocks before the recurrent core; run once
   n_recur: 1              # blocks per row
   n_coda: 0               # readout blocks after the last row
@@ -42,23 +44,24 @@ model:
   # The window attention reaches back over. Reading starts at context_start
   # and grows only when the model is still gaining from the far end of what
   # it has; context_end is the ceiling and binds at load and at every growth.
-  # Sized for ~12 GB VRAM (e.g. RTX 4070); creator baseline was 2048/4096 on 8 GB.
+  # Context is cheap (KV); ceiling high, start higher, grow fast.
   context_start: 3072     # where a fresh model begins
-  context_end: 6144       # and the furthest it may ever reach
+  context_end: 16384      # and the furthest it may ever reach
 
-  context_step: 1                     # characters added per growth
-  context_grow_every_chars: 100_000   # characters between growths
-  context_gain_min: 0.015             # stop growing below this gain from depth
-  context_every_chars: 65536          # characters between asking
+  context_step: 4                     # characters added per growth
+  context_grow_every_chars: 40_000    # characters between growths
+  context_gain_min: 0.008             # stop growing below this gain from depth
+  context_every_chars: 32768          # characters between asking
 
 pool:
   # experts, width, depth and top_k are fixed in the manifest, like the model
   # block. resident, ram_cache and capacity_factor are run-time and can be
   # changed freely.
-  experts: 64             # how many exist at the start; it grows from here
-  width: 2048             # hidden units in one expert
+  # BEST SCALE KNOB: start dense, grow on disk. Card only holds `resident`.
+  experts: 256            # start pool (was 64 creator / 128 mid)
+  width: 3072             # hidden units in one expert (was 2048)
   depth: 1                # SwiGLU blocks stacked inside one expert
-  top_k: 12               # how many one character routes through (was 8 on 8 GB)
+  top_k: 12               # how many one character routes through
 
   # HOW EXPERTS ARE CHOSEN - one rule: the text chooses. Every character
   # ranks the whole pool with the router and asks for its top_k, and every
@@ -72,11 +75,10 @@ pool:
   #
   # Three tiers: disk holds every expert, RAM caches the recently wanted,
   # VRAM holds what the current forward admitted. Only VRAM is scarce.
-  # Sized for ~12 GB VRAM (RTX 4070); creator baseline was resident 32 / ram 96
-  # on an 8 GB 3070 (~5.1 GiB peak). Keep resident/top_k ≈ 4.
-  resident: 48            # experts one forward may use - the card's slots, each
-                          # holding weights, gradient and Adam's moments
-  ram_cache: 144          # RAM - experts kept in system memory
+  # Keep resident/top_k ≈ 4. Expert file ≈ 56.6 MB at 768/3072.
+  resident: 48            # floor for 12 GB; auto_resident may raise further
+  auto_resident: true     # size slots from free VRAM; never below resident
+  ram_cache: 256          # RAM - experts kept in system memory
 
   capacity_factor: 0      # most of a batch one expert may take, as a multiple
                           # of its fair share; the rest is dropped. 0 removes
@@ -128,18 +130,18 @@ training:
   # improving, 0.4% at most at a time - on a plateau a tenth or less in six
   # hours - and up only on clear improvement or new material. The floor
   # (x0.01 of lr) is in plasticity.py.
-  # Peak VRAM tracks chunk (activations); 3072 fits ~12 GB with resident 48.
-  # Creator baseline was 2048 on 8 GB.
-  chunk: 3072             # characters between steps within the window
+  # Peak VRAM tracks chunk x d_model. Wider trunk: keep chunk at creator size.
+  chunk: 2048             # characters between steps within the window
+  # Average this many chunks before an optimiser step. Graph still one chunk;
+  # only .grad accumulates. Cuts update noise on batch-1 without extra VRAM.
+  accum: 2
   lr: 3.0e-4
   trunk_lr_mult: 0.1      # the trunk is shared by every domain and is where
                           # forgetting happens; it learns slower on purpose
   newborn_lr: true        # a newborn expert learns at the full lr - weights,
                           # gate and router row - and its own rate comes down
                           # to the main one as it is trained
-  newborn_half: 15000     # steps of an expert's own training that halve how
-                          # far above the main rate it is, in log terms: a
-                          # week at a 4% share, so it converges over weeks
+  newborn_half: 8000      # faster handoff from newborn lr (was 15000)
   weight_decay: 0.1
   clip: 1.0
 
@@ -150,27 +152,27 @@ growth:
   #   EARNING  the experts added recently are being asked for
   #   FITS     not too many are already inside their trial
   #   HONEST   train and held-out have not separated
-  every_chars: 2_000_000  # characters between growth decisions
-  k: 1                    # experts added per decision
+  # Pool growth is the lifelong scale path. Aggressive early; HONEST brakes it.
+  every_chars: 250_000    # characters between growth decisions
+  k: 4                    # experts added per decision
 
   max_gap: 0.4            # HONEST: train minus held-out. 0 disables
 
   # USED. Staleness is a share of prune.survival_chars: 0.0 when a forward
   # admits an expert, 1.0 when it has gone long enough unadmitted to be
   # deleted. Past prune.dying_at it counts as dying.
-  dying_frac_max: 0.35    # stop growing once this share of the pool is dying
+  dying_frac_max: 0.40    # allow a bit more dying before blocking growth
 
   # FITS.
-  max_in_flight: 50       # experts allowed inside their trial at once
+  max_in_flight: 120      # experts allowed inside their trial at once
 
   # EARNING. Of the experts past their trial and still young, this share must
   # have earned a gate.
-  keep_ratio_min: 0.35
+  keep_ratio_min: 0.30
   recent_mult: 4.0        # "still young" is age < this x the trial
 
-  # ROOM. An expert is 25.2 MB, so 20 GB is about 794 of them.
-  # Disk ceiling, not VRAM; bumped with the 12 GB card so the pool can grow.
-  max_disk_gb: 20.0       # ceiling on the pool on disk. 0 for no limit
+  # ROOM. ~56.6 MB/expert → 100 GB ≈ 1760 experts. Disk is the scale ceiling.
+  max_disk_gb: 100.0      # ceiling on the pool on disk. 0 for no limit
   mem_frac: 0.95          # refuse to grow past this share of the card
 
   birth_gate: 0.001       # gate a new expert starts at - a scale, not a
@@ -179,9 +181,10 @@ growth:
 prune:
   # USE IT OR LOSE IT. An expert is deleted when nothing has admitted it for
   # this long, and it is never deleted inside its first survival_chars.
-  survival_chars: 100_000_000
+  # Longer survival so a bigger pool has time to prove itself before prune.
+  survival_chars: 150_000_000
 
-  dying_at: 0.65          # how far through that window an expert must get,
+  dying_at: 0.70          # how far through that window an expert must get,
                           # unaddressed, to count as dying for growth's brake
 
 data:
@@ -191,19 +194,49 @@ data:
 
   shuffle_seed: 0         # which file and which offset each window comes from
 
-  # Each sub-folder of `train` is a subject, and reading rotates between them.
-  # A window never spans two subjects, but a subject may take several in a row.
-  passage: 32768          # characters read from one file before moving on
+  # Each sub-folder of `train` is a subject. Visits are drawn by weight (not
+  # a fixed round-robin), so speech lanes get more time without starving the
+  # rest. Missing names default to 1. Zero drops a subject.
+  # OpenHermes lands under data/train/chat/ - subject name is `chat`, not
+  # chat_hermes (that label is only for sample prompts).
+  passage: 16384          # characters read from one file before moving on
+  subject_weights:
+    chat: 3.5
+    stories: 3.0
+    reasoning: 2.0
+    code: 1.5
+    self-knowledge: 1.5
+    wikipedia: 0.75
+    arithmetic: 0.75
+    chess: 0.5
+  # First N characters: multiply these subjects' weights (speech first).
+  speech_boost_chars: 200_000_000
+  speech_boost: 2.5
+  speech_subjects: [chat, stories, reasoning, self-knowledge]
+
+serving:
+  # Live chat step size. training.chunk (2048) needs ~20 turns per step;
+  # 512 learns from conversation sooner. Denser diet - see minagi/live.py.
+  learn_chunk: 512
 
 decoding:
   # Generation is greedy - no random numbers - so two samples taken at the
   # same point in training are the same text. What holds off the loops greedy
   # decoding usually falls into is a per-character trace that rises when a
   # character is used and decays after.
-  adapt_strength: 2.5     # logits of suppression for a character just used
+  adapt_strength: 3.0     # logits of suppression for a character just used
   adapt_decay: 0.88       # half-life of 5.4 characters; 0 disables it
+  # How far back the adaptation trace looks. Periods longer than this stay
+  # a model problem; raising it costs almost nothing.
+  adapt_window: 128
 
   rep_penalty: 1.0        # the weaker alternative, off at 1.0
+
+logging:
+  # Heartbeat between sample rounds. 0 disables. Samples still use sample_every.
+  every_min: 2.0
+  # One JSON object per heartbeat/sample/checkpoint for `tail -f`.
+  status: runs/status.jsonl
 
 plots:
   enabled: true           # redraw the graphs whenever the sample log grows
