@@ -42,8 +42,9 @@ model:
   # The window attention reaches back over. Reading starts at context_start
   # and grows only when the model is still gaining from the far end of what
   # it has; context_end is the ceiling and binds at load and at every growth.
-  context_start: 2048     # where a fresh model begins
-  context_end: 4096       # and the furthest it may ever reach
+  # Sized for ~12 GB VRAM (e.g. RTX 4070); creator baseline was 2048/4096 on 8 GB.
+  context_start: 3072     # where a fresh model begins
+  context_end: 6144       # and the furthest it may ever reach
 
   context_step: 1                     # characters added per growth
   context_grow_every_chars: 100_000   # characters between growths
@@ -57,7 +58,7 @@ pool:
   experts: 64             # how many exist at the start; it grows from here
   width: 2048             # hidden units in one expert
   depth: 1                # SwiGLU blocks stacked inside one expert
-  top_k: 8                # how many one character routes through
+  top_k: 12               # how many one character routes through (was 8 on 8 GB)
 
   # HOW EXPERTS ARE CHOSEN - one rule: the text chooses. Every character
   # ranks the whole pool with the router and asks for its top_k, and every
@@ -71,9 +72,11 @@ pool:
   #
   # Three tiers: disk holds every expert, RAM caches the recently wanted,
   # VRAM holds what the current forward admitted. Only VRAM is scarce.
-  resident: 32            # experts one forward may use - the card's slots, each
+  # Sized for ~12 GB VRAM (RTX 4070); creator baseline was resident 32 / ram 96
+  # on an 8 GB 3070 (~5.1 GiB peak). Keep resident/top_k ≈ 4.
+  resident: 48            # experts one forward may use - the card's slots, each
                           # holding weights, gradient and Adam's moments
-  ram_cache: 96           # RAM - experts kept in system memory
+  ram_cache: 144          # RAM - experts kept in system memory
 
   capacity_factor: 0      # most of a batch one expert may take, as a multiple
                           # of its fair share; the rest is dropped. 0 removes
@@ -100,18 +103,18 @@ pool:
   # randomness in what the model writes comes from here.
   #
   #   0     threshold selection, the rule as it has run: the card holds the
-  #         32 experts the text's first row asks for most, and every character
-  #         takes its own top 8 of those
-  #   > 0   drawn: at each row, 8 experts are drawn from the text's
+  #         resident experts the text's first row asks for most, and every
+  #         character takes its own top_k of those
+  #   > 0   drawn: at each row, top_k experts are drawn from the text's
   #         probabilities (the router's full distribution, summed over every
   #         character in the context window) in proportion to p^(1/T), until
-  #         the card's 32 are full, and every character draws its own 8 from
-  #         its own probabilities over the card, the same way
+  #         the card's resident slots are full, and every character draws its
+  #         own top_k from its own probabilities over the card, the same way
   #
   # 1 draws in proportion to the router's probabilities, 0.5 to their
   # squares, 0.2 to their fifth powers. Close to 0 the draws approach each
-  # row's top 8 - which is not quite 0 itself: a drawn card fills 8 a row, so
-  # the first row has only 8 experts where 0 gives it all 32.
+  # row's top_k - which is not quite 0 itself: a drawn card fills top_k a
+  # row, so the first row has only top_k experts where 0 gives it all resident.
   select_temperature: 0
 
 training:
@@ -125,7 +128,9 @@ training:
   # improving, 0.4% at most at a time - on a plateau a tenth or less in six
   # hours - and up only on clear improvement or new material. The floor
   # (x0.01 of lr) is in plasticity.py.
-  chunk: 2048             # characters between steps within the window
+  # Peak VRAM tracks chunk (activations); 3072 fits ~12 GB with resident 48.
+  # Creator baseline was 2048 on 8 GB.
+  chunk: 3072             # characters between steps within the window
   lr: 3.0e-4
   trunk_lr_mult: 0.1      # the trunk is shared by every domain and is where
                           # forgetting happens; it learns slower on purpose
@@ -163,8 +168,9 @@ growth:
   keep_ratio_min: 0.35
   recent_mult: 4.0        # "still young" is age < this x the trial
 
-  # ROOM. An expert is 25.2 MB, so 10 GB is about 397 of them.
-  max_disk_gb: 10.0       # ceiling on the pool on disk. 0 for no limit
+  # ROOM. An expert is 25.2 MB, so 20 GB is about 794 of them.
+  # Disk ceiling, not VRAM; bumped with the 12 GB card so the pool can grow.
+  max_disk_gb: 20.0       # ceiling on the pool on disk. 0 for no limit
   mem_frac: 0.95          # refuse to grow past this share of the card
 
   birth_gate: 0.001       # gate a new expert starts at - a scale, not a
