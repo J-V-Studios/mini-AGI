@@ -528,6 +528,18 @@ This means the first hours of a run look nothing like the rest of it. Loss falls
 
 If a run diverges, it repairs itself: when held-out exceeds the best by more than `--revert-factor` (default 1.5x) the run reloads `weights/`, halves the learning rate, pulls the context back and continues. After `--max-reverts` it stops rather than thrash.
 
+## Bare metal
+
+`metal/` is this same learning machine with nothing underneath it. A BIOS
+boots a freestanding x86-64 image: no host operating system and no C library.
+The weights and Adam's moments sit in physical memory, and the disk at the
+end of the image is where a run is saved. The arithmetic is the one in
+`minagi/` — the 265-value byte vocabulary, RMSNorm, rotary attention, SwiGLU,
+a shared expert pool the text admits, pondering, and AdamW with the trunk at
+a tenth of the expert rate — at a width that fits in the machine's own RAM.
+Fetching corpora and drawing graphs stay on the host, because those talk to
+other machines. Build and boot instructions are in [`metal/README.md`](metal/README.md).
+
 ## Layout
 
 ```
